@@ -21,7 +21,176 @@ from isaaclab.markers import VisualizationMarkers
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedEnv
 
-    from .commands_cfg import NormalVelocityCommandCfg, UniformVelocityCommandCfg
+    from .commands_cfg import NormalVelocityCommandCfg, UniformVelocityCommandCfg, LoopVelocityCommandCfg
+
+
+class LoopVelocityCommand(CommandTerm):
+    """
+    CommandTerm that cycles through a fixed list of forward velocities,
+    advancing every resampling_time_range seconds.  Each command is
+    [vx, 0, 0] in the robot’s base frame.
+    """
+
+    cfg: LoopVelocityCommandCfg
+
+    def __init__(self, cfg: LoopVelocityCommandCfg, env: ManagerBasedEnv):
+        super().__init__(cfg, env)
+
+        # # check configuration
+        # if self.cfg.heading_command and self.cfg.ranges.heading is None:
+        #     raise ValueError(
+        #         "The velocity command has heading commands active (heading_command=True) but the `ranges.heading`"
+        #         " parameter is set to None."
+        #     )
+        # if self.cfg.ranges.heading and not self.cfg.heading_command:
+        #     omni.log.warn(
+        #         f"The velocity command has the 'ranges.heading' attribute set to '{self.cfg.ranges.heading}'"
+        #         " but the heading command is not active. Consider setting the flag for the heading command to True."
+        #     )
+
+        # grab the robot articulation
+        self.robot: Articulation = env.scene[cfg.asset_name]
+
+        # buffer for [vx, vy, ωz]
+        self.vel_command_b = torch.zeros(self.num_envs, 3, device=self.device)
+        self.heading_target = torch.zeros(self.num_envs, device=self.device)
+        self.is_heading_env = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.is_standing_env = torch.zeros_like(self.is_heading_env)
+        # -- metrics
+        self.metrics["error_vel_xy"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["error_vel_yaw"] = torch.zeros(self.num_envs, device=self.device)
+
+        # turn the Python list into a GPU tensor for indexing
+        self._seq = torch.tensor(cfg.sequence, device=self.device)
+
+        # per‐env indices into sequence
+        self._idx = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+
+        # you can also track metrics if you like
+        self.metrics["cycle_steps"] = torch.zeros(self.num_envs, device=self.device)
+
+    def __str__(self) -> str:
+        return (
+            f"LoopVelocityCommand: seq={self.cfg.sequence}, "
+            f"period={self.cfg.resampling_time_range}"
+        )
+
+    @property
+    def command(self) -> torch.Tensor:
+        """Returns the (num_envs, 3) velocity tensor [vx, 0, 0]."""
+        return self.vel_command_b
+
+    def _resample_command(self, env_ids: Sequence[int]):
+        """
+        This is called every `resampling_time_range` seconds for the given envs.
+        We advance the index and set vx accordingly; vy and ωz are zero.
+        """
+        # advance index
+        self._idx[env_ids] = (self._idx[env_ids] + 1) % self._seq.numel()
+
+        # set new vx for each env
+        self.vel_command_b[env_ids, 0] = self._seq[self._idx[env_ids]]
+
+        # zero out the other channels
+        self.vel_command_b[env_ids, 1] = 0.0
+        self.vel_command_b[env_ids, 2] = 0.0
+
+        # optional: track how many steps we've advanced
+        self.metrics["cycle_steps"][env_ids] += 1
+    def _update_metrics(self):
+        # time for which the command was executed
+        max_command_time = self.cfg.resampling_time_range[1]
+        max_command_step = max_command_time / self._env.step_dt
+        # logs data
+        self.metrics["error_vel_xy"] += (
+            torch.norm(self.vel_command_b[:, :2] - self.robot.data.body_link_lin_vel_w[:, 3, :2], dim=-1) / max_command_step
+        )
+        self.metrics["error_vel_yaw"] += (
+            torch.abs(self.vel_command_b[:, 2] - self.robot.data.root_ang_vel_b[:, 2]) / max_command_step
+        )
+    def _update_command(self):
+        """Post-processes the velocity command.
+
+        This function sets velocity command to zero for standing environments and computes angular
+        velocity from heading direction if the heading_command flag is set.
+        """
+        # Compute angular velocity from heading direction
+        if self.cfg.heading_command:
+            # resolve indices of heading envs
+            env_ids = self.is_heading_env.nonzero(as_tuple=False).flatten()
+            # compute angular velocity
+            heading_error = math_utils.wrap_to_pi(self.heading_target[env_ids] - self.robot.data.heading_w[env_ids])
+            self.vel_command_b[env_ids, 2] = torch.clip(
+                self.cfg.heading_control_stiffness * heading_error,
+                min=self.cfg.ranges.ang_vel_z[0],
+                max=self.cfg.ranges.ang_vel_z[1],
+            )
+        # Enforce standing (i.e., zero velocity command) for standing envs
+        # TODO: check if conversion is needed
+        standing_env_ids = self.is_standing_env.nonzero(as_tuple=False).flatten()
+        self.vel_command_b[standing_env_ids, :] = 0.0
+
+    def _set_debug_vis_impl(self, debug_vis: bool):
+        # set visibility of markers
+        # note: parent only deals with callbacks. not their visibility
+        if debug_vis:
+            # create markers if necessary for the first tome
+            if not hasattr(self, "goal_vel_visualizer"):
+                # -- goal
+                self.goal_vel_visualizer = VisualizationMarkers(self.cfg.goal_vel_visualizer_cfg)
+                # -- current
+                self.current_vel_visualizer = VisualizationMarkers(self.cfg.current_vel_visualizer_cfg)
+            # set their visibility to true
+            self.goal_vel_visualizer.set_visibility(True)
+            self.current_vel_visualizer.set_visibility(True)
+        else:
+            if hasattr(self, "goal_vel_visualizer"):
+                self.goal_vel_visualizer.set_visibility(False)
+                self.current_vel_visualizer.set_visibility(False)
+
+    def _debug_vis_callback(self, event):
+        # check if robot is initialized
+        # note: this is needed in-case the robot is de-initialized. we can't access the data
+        if not self.robot.is_initialized:
+            return
+        # get marker location
+        # -- base state
+        base_pos_w = self.robot.data.body_pos_w[:,3,:].clone()
+        base_pos_w[:, 2] += 0.5
+        # -- resolve the scales and quaternions
+        vel_des_arrow_scale, vel_des_arrow_quat = self._resolve_xy_velocity_to_arrow(self.command[:, :2])
+        vel_arrow_scale, vel_arrow_quat = self._resolve_xy_velocity_to_arrow(self.robot.data.body_link_lin_vel_w[:, 3, :2])
+        # vel_arrow_scale, vel_arrow_quat = self._resolve_xy_velocity_to_arrow(self.robot.data.root_lin_vel_w[:, :2])
+
+        # display markers
+        self.goal_vel_visualizer.visualize(base_pos_w, vel_des_arrow_quat, vel_des_arrow_scale)
+        self.current_vel_visualizer.visualize(base_pos_w, vel_arrow_quat, vel_arrow_scale)
+
+    """
+    Internal helpers.
+    """
+
+    def _resolve_xy_velocity_to_arrow(self, xy_velocity: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Converts the XY base velocity command to arrow direction rotation."""
+        # obtain default scale of the marker
+        default_scale = self.goal_vel_visualizer.cfg.markers["arrow"].scale
+        # arrow-scale
+        arrow_scale = torch.tensor(default_scale, device=self.device).repeat(xy_velocity.shape[0], 1)
+        arrow_scale[:, 0] *= torch.linalg.norm(xy_velocity, dim=1) * 3.0
+        # arrow-direction
+        heading_angle = torch.atan2(xy_velocity[:, 1], xy_velocity[:, 0])
+        zeros = torch.zeros_like(heading_angle)
+        arrow_quat = math_utils.quat_from_euler_xyz(zeros, zeros, heading_angle)
+        # convert everything back from base to world frame
+        base_quat_w = self.robot.data.root_quat_w
+        arrow_quat = math_utils.quat_mul(base_quat_w, arrow_quat)
+
+        return arrow_scale, arrow_quat
+
+    # no need to override _update_command unless you want
+    # extra post‐processing (e.g., clamping, debug vis, etc.)
+
+
 
 
 class UniformVelocityCommand(CommandTerm):

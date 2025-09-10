@@ -27,6 +27,11 @@ if TYPE_CHECKING:
 General.
 """
 
+def _check_nan(name, tensor):
+    if torch.isnan(tensor).any():
+        bad_envs = torch.where(torch.isnan(tensor))[0].tolist()
+        print(f"[DEBUG OBS MDP] {name} NaN in envs {bad_envs}")
+
 
 def is_alive(env: ManagerBasedRLEnv) -> torch.Tensor:
     """Reward for being alive."""
@@ -293,7 +298,6 @@ def contact_forces(env: ManagerBasedRLEnv, threshold: float, sensor_cfg: SceneEn
 Velocity-tracking rewards.
 """
 
-
 def track_lin_vel_xy_exp(
     env: ManagerBasedRLEnv, std: float, command_name: str, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
 ) -> torch.Tensor:
@@ -301,11 +305,50 @@ def track_lin_vel_xy_exp(
     # extract the used quantities (to enable type-hinting)
     asset: RigidObject = env.scene[asset_cfg.name]
     # compute the error
+   
+    # lin_vel_error = torch.sum(
+    #     torch.square(env.command_manager.get_command(command_name)[:, :2] - asset.data.root_lin_vel_b[:, :2]),
+    #     dim=1,
+    # )
     lin_vel_error = torch.sum(
-        torch.square(env.command_manager.get_command(command_name)[:, :2] - asset.data.root_lin_vel_b[:, :2]),
+        torch.square(env.command_manager.get_command(command_name)[:, :2] - asset.data.body_link_lin_vel_w[:,3,:2]),
         dim=1,
     )
-    return torch.exp(-lin_vel_error / std**2)
+    cmd_vel   = env.command_manager.get_command(command_name)[:, :2]
+    
+    act_vel   = asset.data.body_link_lin_vel_w[:,3,:2]
+    # print(act_vel,"/",cmd_vel)
+    # return torch.exp(-lin_vel_error / std**2)
+    # print("Cmd vel",cmd_vel)
+    # print("curr vel",act_vel)
+
+    std = max(std, 1e-4)
+
+    final = (-lin_vel_error / std**2)
+    final = torch.clamp(final, -50 , 50)
+    final = torch.exp(final)
+    # print(final)
+    _check_nan("track_lin_vel_xy_exp", final)
+    # final = torch.nan_to_num(final, nan=0.0, posinf=0.0, neginf=0.0)
+    # print(final)
+    return final
+
+"""
+Velocity-tracking rewards with clipping
+"""
+
+# def track_lin_vel_xy_exp(
+#     env: ManagerBasedRLEnv, std: float, command_name: str, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+# ) -> torch.Tensor:
+#     """Reward tracking of linear velocity commands (xy axes) using exponential kernel."""
+#     # extract the used quantities (to enable type-hinting)
+#     asset: RigidObject = env.scene[asset_cfg.name]
+#     # compute the error
+#     lin_vel_error = torch.sum(
+#         torch.square(env.command_manager.get_command(command_name)[:, :2] - asset.data.root_lin_vel_b[:, :2]),
+#         dim=1,
+#     )
+#     return torch.exp(-lin_vel_error / std**2)
 
 
 def track_ang_vel_z_exp(

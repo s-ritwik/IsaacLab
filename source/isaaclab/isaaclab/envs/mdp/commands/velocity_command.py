@@ -1,4 +1,4 @@
-# Copyright (c) 2022-2025, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
+# Copyright (c) 2022-2026, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
 # All rights reserved.
 #
 # SPDX-License-Identifier: BSD-3-Clause
@@ -7,11 +7,11 @@
 
 from __future__ import annotations
 
-import torch
+import logging
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
-import omni.log
+import torch
 
 import isaaclab.utils.math as math_utils
 from isaaclab.assets import Articulation
@@ -192,6 +192,9 @@ class LoopVelocityCommand(CommandTerm):
 
 
 
+# import logger
+logger = logging.getLogger(__name__)
+
 
 class UniformVelocityCommand(CommandTerm):
     r"""Command generator that generates a velocity command in SE(2) from uniform distribution.
@@ -234,7 +237,7 @@ class UniformVelocityCommand(CommandTerm):
                 " parameter is set to None."
             )
         if self.cfg.ranges.heading and not self.cfg.heading_command:
-            omni.log.warn(
+            logger.warning(
                 f"The velocity command has the 'ranges.heading' attribute set to '{self.cfg.ranges.heading}'"
                 " but the heading command is not active. Consider setting the flag for the heading command to True."
             )
